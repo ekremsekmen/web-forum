@@ -482,7 +482,7 @@ func authorize(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := getSession(r, "user")
 		if user == "" || user == "guest" {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			http.Error(w, "Guest Users Cannot Do This Action", http.StatusUnauthorized)
 			return
 		}
 		next(w, r)

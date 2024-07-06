@@ -176,15 +176,15 @@
                                 <p>{{ .Content }}</p>
                                 <p>Comment by {{ .Username }} on {{ .CreatedAt }}</p>
                             </div>
-                        {{ else }}
-                            <p>No comments yet.</p>
                         {{ end }}
+                    {{ else }}
+                        <p>No comments yet.</p>
                     {{ end }}
                     <div class="comment-form">
                         <form action="/comment" method="post">
                             <input type="hidden" name="post_id" value="{{ .ID }}">
                             <label for="comment">Add a comment:</label><br>
-                            <textarea id="comment" name="comment" rows="3" required></textarea><br>
+                            <textarea id="comment" name="content" rows="3" required></textarea><br>
                             <input type="submit" value="Post Comment">
                         </form>
                     </div>
