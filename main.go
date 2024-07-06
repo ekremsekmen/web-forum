@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"strconv"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -26,7 +27,7 @@ func main() {
 
 	http.HandleFunc("/", logInPageHandler(db))
 	http.HandleFunc("/register", registerPageHandler(db))
-	http.HandleFunc("/guestLogin", guestLoginHandler(db))
+	http.HandleFunc("/guestLogin", guestLoginHandler())
 	http.HandleFunc("/forum", forumPageHandler(db))
 	http.HandleFunc("/createPost", authorize(createPostHandler(db)))
 	http.HandleFunc("/like", authorize(likeHandler(db)))
@@ -51,6 +52,8 @@ func createTables(db *sql.DB) error {
         content TEXT NOT NULL,
         user_id INTEGER NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        likes INTEGER DEFAULT 0,
+        dislikes INTEGER DEFAULT 0,
         FOREIGN KEY (user_id) REFERENCES Users(id)
     );`
 
@@ -155,7 +158,7 @@ func logInPageHandler(db *sql.DB) http.HandlerFunc {
 			email := r.FormValue("email")
 			password := r.FormValue("password")
 
-			valid, err := authenticateUser(db, email, password)
+			valid, userID, err := authenticateUser(db, email, password)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusUnauthorized)
 				return
@@ -163,6 +166,7 @@ func logInPageHandler(db *sql.DB) http.HandlerFunc {
 
 			if valid {
 				setSession(w, "user", email)
+				setSession(w, "userID", strconv.Itoa(userID))
 				http.Redirect(w, r, "/forum", http.StatusSeeOther)
 			} else {
 				http.Error(w, "Invalid login credentials", http.StatusUnauthorized)
@@ -171,20 +175,21 @@ func logInPageHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-func authenticateUser(db *sql.DB, email, password string) (bool, error) {
+func authenticateUser(db *sql.DB, email, password string) (bool, int, error) {
 	var dbEmail, dbPassword string
-	err := db.QueryRow("SELECT email, password FROM Users WHERE email = ?", email).Scan(&dbEmail, &dbPassword)
+	var userID int
+	err := db.QueryRow("SELECT id, email, password FROM Users WHERE email = ?", email).Scan(&userID, &dbEmail, &dbPassword)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return false, fmt.Errorf("user not found")
+			return false, 0, fmt.Errorf("user not found")
 		}
-		return false, err
+		return false, 0, err
 	}
 
 	if password == dbPassword {
-		return true, nil
+		return true, userID, nil
 	}
-	return false, fmt.Errorf("invalid password")
+	return false, 0, fmt.Errorf("invalid password")
 }
 
 type Post struct {
@@ -280,9 +285,13 @@ func createPostHandler(db *sql.DB) http.HandlerFunc {
 		if r.Method == http.MethodPost {
 			title := r.FormValue("title")
 			content := r.FormValue("content")
-			userID := 1
+			userID, err := strconv.Atoi(getSession(r, "userID"))
+			if err != nil {
+				http.Error(w, "Unable to get user ID", http.StatusInternalServerError)
+				return
+			}
 
-			err := createPost(db, title, content, userID)
+			err = createPost(db, title, content, userID)
 			if err != nil {
 				http.Error(w, "Unable to create post", http.StatusInternalServerError)
 				return
@@ -303,9 +312,13 @@ func likeHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			postID := r.FormValue("post_id")
-			userID := 1
+			userID, err := strconv.Atoi(getSession(r, "userID"))
+			if err != nil {
+				http.Error(w, "Unable to get user ID", http.StatusInternalServerError)
+				return
+			}
 
-			err := likePost(db, postID, userID)
+			err = likePost(db, postID, userID)
 			if err != nil {
 				http.Error(w, "Unable to like post", http.StatusInternalServerError)
 				return
@@ -317,33 +330,54 @@ func likeHandler(db *sql.DB) http.HandlerFunc {
 }
 
 func likePost(db *sql.DB, postID string, userID int) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	var existingID int
-	err := db.QueryRow("SELECT id FROM Likes WHERE post_id = ? AND user_id = ?", postID, userID).Scan(&existingID)
+	err = tx.QueryRow("SELECT id FROM Likes WHERE post_id = ? AND user_id = ?", postID, userID).Scan(&existingID)
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
 
 	if existingID == 0 {
-		_, err = db.Exec("INSERT INTO Likes (post_id, user_id) VALUES (?, ?)", postID, userID)
+		_, err = tx.Exec("INSERT INTO Likes (post_id, user_id) VALUES (?, ?)", postID, userID)
 		if err != nil {
 			return err
 		}
 
-		_, err = db.Exec("DELETE FROM Dislikes WHERE post_id = ? AND user_id = ?", postID, userID)
+		_, err = tx.Exec("UPDATE Posts SET likes = likes + 1 WHERE id = ?", postID)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec("DELETE FROM Dislikes WHERE post_id = ? AND user_id = ?", postID, userID)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec("UPDATE Posts SET dislikes = dislikes - 1 WHERE id = ? AND (SELECT COUNT(*) FROM Dislikes WHERE post_id = ? AND user_id = ?) > 0", postID, postID, userID)
 		if err != nil {
 			return err
 		}
 	}
-	return nil
+
+	return tx.Commit()
 }
 
 func dislikeHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			postID := r.FormValue("post_id")
-			userID := 1
+			userID, err := strconv.Atoi(getSession(r, "userID"))
+			if err != nil {
+				http.Error(w, "Unable to get user ID", http.StatusInternalServerError)
+				return
+			}
 
-			err := dislikePost(db, postID, userID)
+			err = dislikePost(db, postID, userID)
 			if err != nil {
 				http.Error(w, "Unable to dislike post", http.StatusInternalServerError)
 				return
@@ -355,34 +389,55 @@ func dislikeHandler(db *sql.DB) http.HandlerFunc {
 }
 
 func dislikePost(db *sql.DB, postID string, userID int) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	var existingID int
-	err := db.QueryRow("SELECT id FROM Dislikes WHERE post_id = ? AND user_id = ?", postID, userID).Scan(&existingID)
+	err = tx.QueryRow("SELECT id FROM Dislikes WHERE post_id = ? AND user_id = ?", postID, userID).Scan(&existingID)
 	if err != nil && err != sql.ErrNoRows {
 		return err
 	}
 
 	if existingID == 0 {
-		_, err = db.Exec("INSERT INTO Dislikes (post_id, user_id) VALUES (?, ?)", postID, userID)
+		_, err = tx.Exec("INSERT INTO Dislikes (post_id, user_id) VALUES (?, ?)", postID, userID)
 		if err != nil {
 			return err
 		}
 
-		_, err = db.Exec("DELETE FROM Likes WHERE post_id = ? AND user_id = ?", postID, userID)
+		_, err = tx.Exec("UPDATE Posts SET dislikes = dislikes + 1 WHERE id = ?", postID)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec("DELETE FROM Likes WHERE post_id = ? AND user_id = ?", postID, userID)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.Exec("UPDATE Posts SET likes = likes - 1 WHERE id = ? AND (SELECT COUNT(*) FROM Likes WHERE post_id = ? AND user_id = ?) > 0", postID, postID, userID)
 		if err != nil {
 			return err
 		}
 	}
-	return nil
+
+	return tx.Commit()
 }
 
 func commentHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
+			content := r.FormValue("content")
 			postID := r.FormValue("post_id")
-			content := r.FormValue("comment")
-			userID := 1
+			userID, err := strconv.Atoi(getSession(r, "userID"))
+			if err != nil {
+				http.Error(w, "Unable to get user ID", http.StatusInternalServerError)
+				return
+			}
 
-			err := createComment(db, content, postID, userID)
+			err = addComment(db, content, postID, userID)
 			if err != nil {
 				http.Error(w, "Unable to add comment", http.StatusInternalServerError)
 				return
@@ -393,33 +448,10 @@ func commentHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-func createComment(db *sql.DB, content, postID string, userID int) error {
+func addComment(db *sql.DB, content, postID string, userID int) error {
 	query := "INSERT INTO Comments (content, post_id, user_id) VALUES (?, ?, ?)"
 	_, err := db.Exec(query, content, postID, userID)
 	return err
-}
-
-func guestLoginHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-
-			_ = db.Ping()
-
-			setSession(w, "user", "guest")
-			http.Redirect(w, r, "/forum", http.StatusSeeOther)
-		}
-	}
-}
-
-func authorize(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		user := getSession(r, "user")
-		if user == "guest" {
-			http.Error(w, "Guest users cannot perform this action", http.StatusForbidden)
-			return
-		}
-		next.ServeHTTP(w, r)
-	}
 }
 
 func setSession(w http.ResponseWriter, key, value string) {
@@ -436,4 +468,23 @@ func getSession(r *http.Request, key string) string {
 		return ""
 	}
 	return cookie.Value
+}
+
+func guestLoginHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		setSession(w, "user", "guest")
+		setSession(w, "userID", "0")
+		http.Redirect(w, r, "/forum", http.StatusSeeOther)
+	}
+}
+
+func authorize(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := getSession(r, "user")
+		if user == "" || user == "guest" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
